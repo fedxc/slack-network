@@ -26,6 +26,46 @@ it only reads/writes JSON. The agent does the Slack I/O; the script does the mat
 
 ---
 
+## Slack MCP Server
+
+All Slack I/O goes through Slack's **official hosted MCP server**:
+
+- **Endpoint:** `https://mcp.slack.com/mcp` (remote HTTP MCP — nothing to install).
+- **Auth:** OAuth — connect once in your client ("Connect to Slack"). The server acts
+  **as the authenticated user**, so the agent only sees channels, DMs, threads, and files
+  that user belongs to. Private channels the user isn't in are invisible (handled by the
+  403-skip path in Error Handling).
+
+### Tools this skill uses
+
+| Tool | Used in | Purpose |
+|------|---------|---------|
+| `slack_search_channels` | A1 | discover channels (metadata only) |
+| `slack_search_public_and_private` | A1.5, B2 | find recently-active channels / the delta window |
+| `slack_search_users` | A3 | enumerate workspace members |
+| `slack_read_channel` | A4, B2 | read a channel's recent top-level messages |
+| `slack_read_thread` | A4, B2 | read a thread's replies (the thread-reply signal) |
+| `slack_read_user_profile` | A3 (optional) | backfill a user's title/profile |
+| `slack_send_message` | Output (optional) | post the run report to a channel |
+| `slack_create_canvas` / `slack_update_canvas` | Output (optional) | publish the report as a Slack canvas |
+
+The server also exposes `slack_search_public` (public-only search) and `slack_read_canvas`,
+which this skill doesn't need.
+
+### Connector behavior to plan around
+
+- **Cursor pagination.** Tools return **bounded pages** with a `cursor`, not unlimited
+  result sets. The message caps in Configuration (100/channel bootstrap, 50/channel delta)
+  may take **several chained calls** per channel — page until you hit the cap or run dry.
+- **Search needs real queries.** Don't assume an empty query dumps the whole workspace; use
+  explicit filters (`after:`, name/description terms) and paginate. Treat any one response
+  as a page, not the universe.
+- **Rate limits.** Search is the tightest tier — use it for *targeting* (which channels are
+  alive), then spend channel/thread reads on the scorer-selected set. This budget discipline
+  is the whole reason the scorer exists.
+
+---
+
 ## Pre-Flight: Determine Run Mode
 
 Before anything else, check for an existing state file in Google Drive.
@@ -48,9 +88,9 @@ Store the Drive file ID when found — you'll need it to update in place later.
 ### A1. Discover Channels (metadata only)
 
 ```
-Tool: Slack:slack_search_channels
-Query: "" (empty → returns all accessible channels)
-Limit: 200
+Tool: slack_search_channels
+Query: "" (broad listing of accessible channels)
+Limit: 200   ← per page; chain the returned cursor to cover the rest of the workspace
 ```
 
 For each channel returned, record the metadata only (no message reads yet):
@@ -69,7 +109,7 @@ One cheap search surfaces channels with activity in the crawl window, which is a
 "this channel is alive" signal for the scorer:
 
 ```
-Tool: Slack:slack_search_public_and_private
+Tool: slack_search_public_and_private
 query: "after:<YYYY-MM-DD>"   ← e.g. 14 days ago
 sort_by: timestamp
 ```
@@ -105,12 +145,13 @@ graph quality — spend your rate-limit budget on channels that carry working re
 ### A3. Enumerate Users
 
 ```
-Tool: Slack:slack_search_users
-Query: "" (empty → returns workspace members)
+Tool: slack_search_users
+Query: "" (broad listing of workspace members; paginate via the returned cursor)
 ```
 
 For each user: record `user_id`, `display_name`, `real_name`, `title`. Exclude bots
 (`is_bot`) and deactivated users. Write `users.json` as `{ user_id → { name, real_name, title } }`.
+If search results omit a title you care about, backfill it with `slack_read_user_profile`.
 
 (Run this before A2 if you want the scorer to know `workspace_size` precisely; it falls
 back to `member_count` of the largest channel otherwise.)
@@ -120,9 +161,9 @@ back to `member_count` of the largest channel otherwise.)
 For each channel in `crawl_plan.json.crawl`:
 
 ```
-Tool: Slack:slack_read_channel
+Tool: slack_read_channel
 channel_id: <channel_id>
-limit: 100   ← most recent 100 messages per channel on bootstrap
+limit: 100   ← most recent 100 messages per channel on bootstrap (page via cursor to reach it)
 ```
 
 Extract **directed** interaction signals. Direction matters — "A mentions B" is not the
@@ -141,6 +182,12 @@ Emit one raw record per interaction (note `from` = actor, `to` = target):
 { "from": "U123", "to": "U456", "signal": "mention", "weight": 3.0,
   "channel": "C789", "ts": 1718000000.0 }
 ```
+
+> **Threads need a second call.** `slack_read_channel` returns top-level messages only.
+> For any message that has replies (`reply_count > 0`), call `slack_read_thread`
+> (`channel_id` + `thread_ts`) to enumerate the repliers, then emit
+> `replier → thread_author` records (weight 1.5). Without this step the thread-reply
+> signal is missing entirely. Count thread replies against the per-channel message budget.
 
 Co-presence is **ambient context, not endorsement** — the engine keeps it on a separate
 channel-size-discounted track and excludes it from centrality (see A5). Accumulate all
@@ -223,20 +270,21 @@ Write to `prev_state.json`. Parse `meta.last_run` (ISO timestamp).
 Time-bounded search first, then targeted reads:
 
 ```
-Tool: Slack:slack_search_public_and_private
+Tool: slack_search_public_and_private
 query: "after:<YYYY-MM-DD>"   ← date derived from last_run
 sort_by: timestamp
 ```
 
 ```
-Tool: Slack:slack_read_channel
+Tool: slack_read_channel
 channel_id: <channel_id>
-limit: 50   ← sufficient for a 24h delta
+limit: 50   ← sufficient for a 24h delta (page via cursor if needed)
 ```
 
 Crawl channels that appear in search results plus the persisted `crawl` set from bootstrap.
-Skip quiet channels. Accumulate new signals into `delta_interactions.json` (same record
-format as A4).
+Skip quiet channels. As in A4, follow up any message with `reply_count > 0` using
+`slack_read_thread` to capture new thread replies. Accumulate new signals into
+`delta_interactions.json` (same record format as A4).
 
 ### B3. Run Delta Computation
 
@@ -273,7 +321,9 @@ Tool: Google Drive:create_file (overwrite)
 ## Output Report
 
 After either phase, emit a structured report. Format as a Slack message draft if the user
-has a preferred reporting channel; otherwise output inline.
+has a preferred reporting channel; otherwise output inline. To deliver it in Slack, post
+with `slack_send_message`, or publish the full snapshot as a Slack **canvas** via
+`slack_create_canvas` (and update it in place on later runs with `slack_update_canvas`).
 
 ### Bootstrap Report Template
 
@@ -410,8 +460,9 @@ user**. It catches the failure modes the frontend hides:
 | Bootstrap channel cap | 60 | `--channel-cap N` |
 | Decay half-life | 30 days | `--decay-halflife N` |
 | Edge weight floor (prune) | 0.5 | `--min-weight N` |
-| Bootstrap messages/channel | 100 | agent-side (Slack `limit`) |
-| Delta messages/channel | 50 | agent-side (Slack `limit`) |
+| Bootstrap messages/channel | 100 | agent-side (Slack `limit`, paged via cursor) |
+| Delta messages/channel | 50 | agent-side (Slack `limit`, paged via cursor) |
+| Slack MCP endpoint | `https://mcp.slack.com/mcp` | fixed (OAuth, acts as the connected user) |
 | Drive folder name | "Slack Network Analysis" | edit in this file |
 | State filename | `slack_network_state.json` | fixed |
 | Backup prefix | `slack_network_state_` | fixed |
@@ -425,8 +476,10 @@ the script — the script only ever sees the JSON you hand it.
 
 | Situation | Action |
 |-----------|--------|
+| Slack MCP not connected / OAuth expired | Prompt the user to (re)connect Slack at `https://mcp.slack.com/mcp`; don't fabricate data |
+| Slack rate limit hit (429) | Back off and retry; if persistent, lower `--channel-cap` or the `limit` and note partial coverage in the report |
 | Drive file not found | Re-run bootstrap, don't error |
-| Channel read fails (403) | Skip channel, log name in report |
+| Channel read fails (403) | Skip channel (user not a member / no access), log name in report |
 | No messages in delta window | Emit "quiet period" report, still apply decay |
 | User in edges but not in users map | Add as anonymous node `{user_id, name: "unknown"}` |
 | networkx not available | `pip install networkx python-louvain --break-system-packages` |
