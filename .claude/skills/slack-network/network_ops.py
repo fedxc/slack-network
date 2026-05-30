@@ -5,7 +5,7 @@ Standalone script. Reads/writes JSON only. No Slack API calls here.
 
 CLI Modes
 ---------
-  score-channels  Rank/filter channels for crawling (cheap, metadata-only)
+  score-channels  Rank/filter channels for crawling (cheap; metadata + learned yield prior)
   bootstrap       Build a fresh graph from raw interaction records
   delta           Merge new interactions into existing state + apply decay
   query           Analyze relationship between two specific users
@@ -14,7 +14,7 @@ CLI Modes
 
 Usage
 -----
-  python network_ops.py --mode score-channels --channels channels.json --users users.json --output crawl_plan.json [--channel-cap 60]
+  python network_ops.py --mode score-channels --channels channels.json --users users.json --output crawl_plan.json [--channel-cap 60] [--recent recent.json] [--prior prev_state.json]
   python network_ops.py --mode bootstrap --input raw.json --users users.json [--channels channels.json] --output state.json
   python network_ops.py --mode delta     --input delta.json --state prev.json --output new.json [--decay-halflife 30]
   python network_ops.py --mode query     --state state.json --user1 U123 --user2 U456
@@ -131,12 +131,24 @@ BROADCAST_PATTERNS = [
 _WORK_RE = re.compile("|".join(WORK_PATTERNS), re.I)
 _BROADCAST_RE = re.compile("|".join(BROADCAST_PATTERNS), re.I)
 
+# Looser, unanchored matches for channel topic/purpose text and cryptically-named
+# channels (e.g. "c-ops-7" whose topic says "Project Atlas working group"). These are
+# weighted below the anchored name patterns above so they only nudge, never dominate.
+_WORK_LOOSE_RE = re.compile(
+    r"\b(project|team|engineering|squad|incident|on[-_ ]?call|launch|design|"
+    r"platform|backend|frontend|sprint|roadmap|standup|retro|planning|triage|"
+    r"support|customer|client|deploy|release|rollout|working group|task ?force)\b", re.I)
+_BROADCAST_LOOSE_RE = re.compile(
+    r"\b(announce|company[-_ ]?wide|town[-_ ]?hall|all[-_ ]?hands|newsletter|"
+    r"water[-_ ]?cooler|watercooler|social|off[-_ ]?topic)\b", re.I)
+
 
 # ===========================================================================
 # CHANNEL SCORING  (cheap, metadata-only — runs BEFORE any message crawl)
 # ===========================================================================
 
-def score_channels(channels, workspace_size, channel_cap=60, recently_active_ids=None):
+def score_channels(channels, workspace_size, channel_cap=60, recently_active_ids=None,
+                   prior_stats=None):
     recently_active_ids = set(recently_active_ids or [])
     now = time.time()
     workspace_size = max(workspace_size, 1)
@@ -152,6 +164,10 @@ def score_channels(channels, workspace_size, channel_cap=60, recently_active_ids
         score = 0.0
         vetoed = False
 
+        topic = (ch.get("topic") or "").strip()
+        purpose = (ch.get("purpose") or "").strip()
+        text = f"{name} {topic} {purpose}"
+
         if _BROADCAST_RE.search(name):
             score -= 6.0
             reasons.append("broadcast/social name (-6)")
@@ -161,6 +177,12 @@ def score_channels(channels, workspace_size, channel_cap=60, recently_active_ids
         if _WORK_RE.search(name):
             score += 4.0
             reasons.append("work-channel name (+4)")
+        elif _WORK_LOOSE_RE.search(text):
+            score += 2.0
+            reasons.append("work topic/purpose match (+2)")
+        if _BROADCAST_LOOSE_RE.search(f"{topic} {purpose}"):
+            score -= 3.0
+            reasons.append("broadcast topic/purpose match (-3)")
 
         frac = members / workspace_size
         if members < 3:
@@ -174,27 +196,51 @@ def score_channels(channels, workspace_size, channel_cap=60, recently_active_ids
             reasons.append(f"mid size ({members}, +1)")
         if frac >= 0.6:
             score -= 6.0
-            reasons.append(f"~{frac:.0%} of workspace (-6)")
+            vetoed = True            # org-wide by membership → phantom-edge factory, hard veto
+            reasons.append(f"~{frac:.0%} of workspace — org-wide (veto)")
         elif frac >= 0.35:
             score -= 3.0
             reasons.append(f"~{frac:.0%} of workspace (-3)")
 
+        # Liveness is capped at +3 total (recent-search and last-message are the same fact),
+        # so an active broadcast channel can't out-score its name/size penalties.
         last_ts = ch.get("last_message_ts") or ch.get("latest_ts") or 0.0
+        recency_bonus = 0.0
         if cid in recently_active_ids:
-            score += 3.0
+            recency_bonus = 3.0
             reasons.append("active in recent search (+3)")
         if last_ts:
             days = (now - float(last_ts)) / 86400.0
             if days <= 7:
-                score += 3.0; reasons.append("active <=7d (+3)")
+                recency_bonus = max(recency_bonus, 3.0); reasons.append("active <=7d (+3)")
             elif days <= 30:
-                score += 1.0; reasons.append("active <=30d (+1)")
+                recency_bonus = max(recency_bonus, 1.0); reasons.append("active <=30d (+1)")
             elif days > 90:
                 score -= 2.0; reasons.append("stale >90d (-2)")
+        score += recency_bonus
 
         if ch.get("is_private"):
             score += 0.5
             reasons.append("private (+0.5)")
+
+        # Learned prior: reward channels that actually produced relationship signal on a
+        # previous run, penalize ones we crawled but that yielded nothing. This is the
+        # feedback loop that lets observed yield, not just metadata, drive selection.
+        st = (prior_stats or {}).get(cid)
+        if st is not None:
+            p = float(st.get("ema_pairs", st.get("pairs", 0)) or 0)
+            if p > 0:
+                bonus = min(5.0, 1.6 * math.log2(p + 1))
+                score += bonus
+                reasons.append(f"prior yield ~{p:.0f} pairs (+{bonus:.1f})")
+                pr = st.get("pairs", 0) or 0
+                rr = (st.get("reciprocal_pairs", 0) / pr) if pr else 0.0
+                if rr > 0:
+                    score += 2.0 * rr
+                    reasons.append(f"prior reciprocity {rr:.0%} (+{2.0 * rr:.1f})")
+            else:
+                score -= 2.0
+                reasons.append("crawled before, no signal (-2)")
 
         scored.append({
             "channel_id": cid, "name": name, "member_count": members,
@@ -566,7 +612,57 @@ def merge_delta(G_prev, new_interactions, users, channel_sizes=None):
 # SERIALIZATION
 # ===========================================================================
 
-def graph_to_state(G, users, meta, channel_names=None, prev_communities=None):
+def channel_yield(raw_interactions):
+    """Per-channel signal yield for a run (directed signals only, co-presence excluded).
+
+    Feeds the scorer's learning loop: how many distinct interacting pairs a channel
+    surfaced, and how many were reciprocated. Channels that produced real, mutual ties
+    float up next run; channels we crawled but that stayed silent get penalized."""
+    per = defaultdict(lambda: {"interactions": 0, "dirs": defaultdict(set)})
+    for rec in raw_interactions:
+        if rec.get("signal", "co_presence") not in DIRECTED_SIGNALS:
+            continue
+        u, v, ch = rec.get("from"), rec.get("to"), rec.get("channel", "")
+        if not u or not v or u == v or not ch:
+            continue
+        d = per[ch]
+        d["interactions"] += 1
+        a, b = sorted([u, v])
+        d["dirs"][(a, b)].add(u == a)        # records which direction(s) we've seen
+    stats = {}
+    for ch, d in per.items():
+        pairs = len(d["dirs"])
+        recip = sum(1 for seen in d["dirs"].values() if len(seen) == 2)
+        stats[ch] = {"interactions": d["interactions"], "pairs": pairs,
+                     "reciprocal_pairs": recip, "ema_pairs": float(pairs)}
+    return stats
+
+
+def merge_channel_stats(prev, new, alpha=0.5):
+    """EMA-merge per-channel yield across runs so the prior tracks *recent* signal.
+
+    A channel absent from this run (not crawled / went quiet) decays toward zero rather
+    than keeping a stale high score forever."""
+    prev = prev or {}
+    new = new or {}
+    merged = {}
+    for ch in set(prev) | set(new):
+        p, n = prev.get(ch), new.get(ch)
+        prev_ema = float((p or {}).get("ema_pairs", (p or {}).get("pairs", 0.0)) or 0.0)
+        if n:
+            new_pairs = float(n.get("pairs", 0.0) or 0.0)
+            ema = alpha * prev_ema + (1 - alpha) * new_pairs if p else new_pairs
+            merged[ch] = {"interactions": n.get("interactions", 0),
+                          "pairs": n.get("pairs", 0),
+                          "reciprocal_pairs": n.get("reciprocal_pairs", 0),
+                          "ema_pairs": round(ema, 2)}
+        else:
+            merged[ch] = {**p, "ema_pairs": round(alpha * prev_ema, 2)}
+    return merged
+
+
+def graph_to_state(G, users, meta, channel_names=None, prev_communities=None,
+                   channel_stats=None):
     channel_names = channel_names or {}
     centrality = compute_centrality(G)
     raw_partition = detect_communities(G)
@@ -629,7 +725,7 @@ def graph_to_state(G, users, meta, channel_names=None, prev_communities=None):
     return {
         "schema_version": SCHEMA_VERSION, "meta": meta, "nodes": nodes, "edges": edges,
         "communities": communities, "affiliation_top": affiliation_top,
-        "channel_names": channel_names,
+        "channel_names": channel_names, "channel_stats": channel_stats or {},
     }
 
 
@@ -977,6 +1073,8 @@ def main():
     p.add_argument("--user1")
     p.add_argument("--user2")
     p.add_argument("--recent")
+    p.add_argument("--prior", help="previous network_state.json; its channel_stats seed "
+                                    "the scorer's learned yield prior (score-channels)")
     p.add_argument("--decay-halflife", type=float, default=DEFAULT_DECAY_HALFLIFE)
     p.add_argument("--channel-cap", type=int, default=60)
     p.add_argument("--min-weight", type=float, default=DEFAULT_MIN_WEIGHT)
@@ -999,8 +1097,13 @@ def main():
         if args.recent:
             with open(args.recent) as f:
                 recent = json.load(f)
+        prior_stats = None
+        if args.prior:
+            with open(args.prior) as f:
+                prior_stats = json.load(f).get("channel_stats", {})
         plan = score_channels(channels, workspace_size,
-                              channel_cap=args.channel_cap, recently_active_ids=recent)
+                              channel_cap=args.channel_cap, recently_active_ids=recent,
+                              prior_stats=prior_stats)
         with open(args.output, "w") as f:
             json.dump(plan, f, indent=2)
         print(f"Scored {len(plan['ranked'])} channels -> crawl {len(plan['crawl'])} "
@@ -1021,7 +1124,8 @@ def main():
                 "last_run_ts": now_ts, "nodes_count": G.number_of_nodes(),
                 "edges_count": G.number_of_edges(), "messages_processed": len(raw),
                 "algo": {"decay_halflife_days": args.decay_halflife}}
-        state = graph_to_state(G, users, meta, channel_names=names)
+        cstats = channel_yield(raw)
+        state = graph_to_state(G, users, meta, channel_names=names, channel_stats=cstats)
         with open(args.output, "w") as f: json.dump(state, f, indent=2)
         print(f"Bootstrap: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges -> {args.output}")
         rep = validate_state(state)
@@ -1053,8 +1157,11 @@ def main():
                 "edges_count": G.number_of_edges(),
                 "messages_processed": pm.get("messages_processed", 0) + len(new_interactions),
                 "delta_summary": delta, "algo": {"decay_halflife_days": args.decay_halflife}}
+        cstats = merge_channel_stats(prev_state.get("channel_stats", {}),
+                                     channel_yield(new_interactions))
         state = graph_to_state(G, users, meta, channel_names=names,
-                               prev_communities=prev_state.get("communities", {}))
+                               prev_communities=prev_state.get("communities", {}),
+                               channel_stats=cstats)
         with open(args.output, "w") as f: json.dump(state, f, indent=2)
         print(f"Delta run #{meta['run_count']}: +{len(delta['new_edges'])} new, "
               f"{len(delta['strengthened_edges'])} strengthened, "
