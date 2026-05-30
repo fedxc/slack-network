@@ -223,10 +223,6 @@
   .lpill.on{background:var(--parchment-3);border-color:var(--espresso)}
   .lpill.on .sw{box-shadow:0 0 0 2px var(--pc)}
   .lpill.dimmed{opacity:.38}
-  .legend .lclear{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;
-    color:var(--ink-faint);cursor:pointer;border:none;background:none;padding:6px 2px 1px;display:none}
-  .legend.has-sel .lclear{display:block}
-  .legend .lclear:hover{color:var(--terracotta)}
 
   /* —— cluster popover (hover on a legend pill) —— */
   .cpop{position:fixed;z-index:70;pointer-events:none;opacity:0;transform:translateY(4px);
@@ -254,8 +250,6 @@
   .modal .mbox{position:relative;border:2px solid var(--espresso);background:var(--cream);
     box-shadow:8px 8px 0 var(--espresso);padding:28px 30px;width:min(440px,92vw);max-height:86vh;
     overflow:auto;animation:drop .3s cubic-bezier(.2,.8,.2,1) both}
-  .modal .mbox::before{content:"FIG. 02";position:absolute;top:-2px;right:-2px;background:var(--espresso);
-    color:var(--cream);font-family:var(--mono);font-size:9px;letter-spacing:.2em;padding:4px 9px}
   .modal h2{font-family:var(--fdisp);font-weight:800;margin:0 0 4px;font-size:25px;letter-spacing:-.02em}
   .modal h2 em{font-style:italic;color:var(--terracotta);font-weight:600}
   .modal p{font-family:var(--fsans);color:var(--ink-dim);font-size:12.5px;margin:0 0 18px;line-height:1.5}
@@ -666,9 +660,9 @@ function loadData(raw){
    the graph (highlight its nodes, grey the rest). */
 function buildLegend(){
   const el = document.getElementById('legend');
-  if(!G){ el.innerHTML=''; el.classList.remove('has-sel'); return; }
+  if(!G){ el.innerHTML=''; return; }
   const ids = Object.keys(G.comm).map(Number).sort((a,b)=>a-b);
-  if(!ids.length){ el.innerHTML=''; el.classList.remove('has-sel'); return; }
+  if(!ids.length){ el.innerHTML=''; return; }
   let pills = '';
   for(const id of ids){
     const c = G.comm[String(id)]||{};
@@ -678,17 +672,13 @@ function buildLegend(){
              `<span class="sw"></span><b>Cluster ${id}</b><span class="ct">${cnt}</span></button>`;
     // (count is rendered minimally; channels + insight live in the hover popover)
   }
-  el.classList.toggle('has-sel', selComm!=null);
-  el.innerHTML = `<span class="lh">Communities</span><div class="lpills">${pills}</div>`+
-                 `<button class="lclear" id="legendClear">✕ clear isolation</button>`;
+  el.innerHTML = `<span class="lh">Communities</span><div class="lpills">${pills}</div>`;
   el.querySelectorAll('.lpill').forEach(p=>{
     const id = +p.dataset.cid;
     p.addEventListener('mouseenter', ()=>showCpop(id, p));
     p.addEventListener('mouseleave', hideCpop);
     p.addEventListener('click', ()=>{ hideCpop(); selectCommunity(id); });
   });
-  const clr = document.getElementById('legendClear');
-  if(clr) clr.onclick = ()=>selectCommunity(null);
 }
 
 function commMembers(id){ return G.nodes.filter(n=>n.community_id===id); }
@@ -1424,7 +1414,12 @@ function pickFile(){ document.getElementById('file').click(); }
 document.getElementById('btn-load').onclick=pickFile;
 document.getElementById('drop-pick').onclick=pickFile;
 document.getElementById('file').addEventListener('change',e=>{
-  const f=e.target.files[0]; if(!f) return;
+  const input=e.target;
+  const f=input.files[0];
+  // reset the input so picking the *same* file again still fires 'change'
+  // (e.g. load file → Sample → load that same file)
+  input.value='';
+  if(!f) return;
   const rd=new FileReader(); rd.onload=()=>{ try{ loadData(JSON.parse(rd.result)); }catch(err){ alert('Invalid JSON: '+err.message);} };
   rd.readAsText(f);
 });
