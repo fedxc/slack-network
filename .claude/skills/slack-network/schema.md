@@ -20,7 +20,8 @@ still load (`delta`, `query`, and the visualizer upgrade them on read).
   "edges":          { "UID1:UID2": { ... } },
   "communities":    { "COMMUNITY_ID": { ... } },
   "affiliation_top":[ { ... } ],
-  "channel_names":  { "CHANNEL_ID": "channel-name" }
+  "channel_names":  { "CHANNEL_ID": "channel-name" },
+  "channel_stats":  { "CHANNEL_ID": { ... } }
 }
 ```
 
@@ -217,6 +218,24 @@ Computed at **bootstrap** (needs the participation matrix); empty `[]` on delta 
 
 `{ channel_id → name }`, present when `--channels` was supplied. Used for readable
 community labels and reporting.
+
+---
+
+## `channel_stats`
+
+`{ channel_id → { interactions, pairs, reciprocal_pairs, ema_pairs } }` — the **learned
+yield** per channel, written by `bootstrap`/`delta` and consumed by `score-channels
+--prior` to drive the selection feedback loop.
+
+| Field | Meaning |
+|-------|---------|
+| `interactions` | count of directed-signal records (DM/mention/thread/reaction; co-presence excluded) the channel produced this run |
+| `pairs` | distinct user pairs that interacted in the channel this run |
+| `reciprocal_pairs` | of those, how many were seen in **both** directions |
+| `ema_pairs` | exponential moving average of `pairs` across runs (α=0.5); the value the scorer actually rewards, so a channel that goes quiet decays rather than keeping a stale high score |
+
+Computed from directed signals only, so co-presence can't inflate a channel's apparent
+yield. Absent on v1 states and harmless if missing — the scorer simply runs without a prior.
 
 ---
 

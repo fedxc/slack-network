@@ -94,8 +94,10 @@ Limit: 200   ← per page; chain the returned cursor to cover the rest of the wo
 ```
 
 For each channel returned, record the metadata only (no message reads yet):
-`channel_id`, `name`, `member_count`, `is_private`, `is_archived`, `last_message_ts`.
-Write the list to `channels.json`.
+`channel_id`, `name`, `member_count`, `is_private`, `is_archived`, `last_message_ts`,
+and — when the API returns them — `topic` and `purpose`. The scorer reads `topic`/`purpose`
+so a cryptically-named channel (`c-ops-7`) whose topic says "Project Atlas working group"
+still gets recognized as work. Write the list to `channels.json`.
 
 > **Do NOT just take the top channels by member count.** The highest-membership
 > channels are almost always `#general`, `#announcements`, HR, and social — they carry
@@ -124,7 +126,8 @@ scorer degrades gracefully without it.
 python network_ops.py --mode score-channels \
   --channels channels.json \
   --users users.json \
-  --recent recent.json \        # optional; omit if you skipped A1.5
+  --recent recent.json \         # optional; omit if you skipped A1.5
+  --prior prev_state.json \      # optional; the learned-yield loop (delta runs — see below)
   --channel-cap 60 \
   --output crawl_plan.json
 ```
@@ -133,14 +136,23 @@ The scorer ranks every channel on cheap metadata using a composite of:
 
 | Signal | Effect |
 |--------|--------|
-| **Name pattern** | `proj-`, `team-`, `eng-`, `incident-`, `squad-`, `support-`, … → boost. `general`, `random`, `announcements`, `hr-`, `memes`, `*-bot`, `alerts` → penalty. `general`/`random`/`announcements` are hard-**vetoed**. |
-| **Size band** | Peaks at ~3–25 members (a working group). Penalizes channels holding >35% / >60% of the workspace (broadcast). |
-| **Recency** | Active in window (from `recent.json` or `last_message_ts`) → boost; stale → penalty. |
+| **Name pattern** | `proj-`, `team-`, `eng-`, `incident-`, `squad-`, `support-`, … → boost (+4). `general`, `random`, `announcements`, `hr-`, `memes`, `*-bot`, `alerts` → penalty (−6). `general`/`random`/`announcements` hard-**vetoed**. |
+| **Topic / purpose** | Work terms in the channel topic/purpose → boost (+2) even when the name is cryptic; broadcast terms (town-hall, all-hands, newsletter…) → penalty (−3). |
+| **Size band** | Peaks at ~3–25 members (a working group). `≥35%` of the workspace → −3; **`≥60%` → hard veto** (org-wide channels are the O(n²) phantom-edge factories). |
+| **Recency** | Active in window (from `recent.json` or `last_message_ts`) → boost, **capped at +3** so liveness can't rescue a broadcast channel; stale >90d → penalty. |
 | **Private** | Small bonus (private channels skew toward real working groups). |
+| **Learned yield** (`--prior`) | Channels that produced real, reciprocated ties last run → boost (up to +5, plus a reciprocity bonus). Channels crawled before that yielded **no** signal → −2. This is the feedback loop that lets observed results — not just metadata — drive selection. |
 
 `crawl_plan.json` contains `{ ranked, crawl, workspace_size, channel_cap }`. **Crawl only
 the `crawl` list** (already capped and veto-filtered). This is the single biggest lever on
 graph quality — spend your rate-limit budget on channels that carry working relationships.
+
+> **Learned-yield loop.** Pass `--prior <previous state.json>` (you already have
+> `prev_state.json` on delta runs, Phase B) and the scorer reads its `channel_stats` —
+> per-channel pairs surfaced + reciprocity, EMA-smoothed across runs. Re-running
+> `score-channels` with `--prior` periodically (or each delta) refreshes the crawl set:
+> proven channels rise, channels that looked good by name but never produced signal sink.
+> On the very first bootstrap there's no prior — the scorer runs on metadata alone.
 
 ### A3. Enumerate Users
 
@@ -285,6 +297,12 @@ Crawl channels that appear in search results plus the persisted `crawl` set from
 Skip quiet channels. As in A4, follow up any message with `reply_count > 0` using
 `slack_read_thread` to capture new thread replies. Accumulate new signals into
 `delta_interactions.json` (same record format as A4).
+
+> **Refresh the crawl set with learned yield.** Periodically (or every delta) re-run A2's
+> `score-channels` with `--prior prev_state.json` — the scorer reads the previous run's
+> `channel_stats` and re-ranks: channels that produced real reciprocated ties rise into the
+> crawl set, channels that were crawled but stayed silent drop out. This is what turns the
+> per-run yield bookkeeping into an actual selection improvement over time.
 
 ### B3. Run Delta Computation
 
