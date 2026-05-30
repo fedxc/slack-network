@@ -205,31 +205,27 @@
     background-image:linear-gradient(var(--rule) 1px,transparent 1px),linear-gradient(90deg,var(--rule) 1px,transparent 1px);
     background-size:44px 44px}
   canvas{display:block;width:100%;height:100%;position:relative;z-index:1}
-  /* —— legend: a horizontal discovery strip of cluster pills —— */
-  .legend{position:absolute;left:18px;right:18px;bottom:18px;background:var(--cream);
-    border:2px solid var(--espresso);box-shadow:var(--shadow);padding:10px 13px;z-index:2;
-    display:flex;align-items:center;gap:13px;flex-wrap:wrap;max-height:40vh;overflow:auto}
+  /* —— legend: a minimal vertical column of cluster rows (detail lives in the popover) —— */
+  .legend{position:absolute;left:18px;bottom:18px;width:204px;background:var(--cream);
+    border:2px solid var(--espresso);box-shadow:var(--shadow);padding:11px 12px 9px;z-index:2;
+    max-height:52vh;overflow:auto}
   .legend .lh{font-family:var(--fdisp);font-style:italic;font-weight:600;font-size:13px;color:var(--espresso);
-    letter-spacing:0;text-transform:none;flex:none;margin-right:2px}
-  .legend .lpills{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-  .lpill{display:flex;align-items:center;gap:8px;padding:6px 11px 6px 9px;cursor:pointer;
-    border:2px solid var(--espresso);background:var(--cream);box-shadow:var(--shadow-xs);
-    font-family:var(--fsans);transition:.12s;user-select:none;border-radius:0}
-  .lpill:hover{transform:translate(-1px,-1px);box-shadow:var(--shadow-sm);background:var(--parchment-3)}
-  .lpill .sw{width:13px;height:13px;border:1.5px solid var(--espresso);flex:none;background:var(--pc,var(--ink-faint))}
+    letter-spacing:0;text-transform:none;display:block;margin-bottom:7px}
+  .legend .lpills{display:flex;flex-direction:column;gap:1px}
+  .lpill{display:flex;align-items:center;gap:9px;width:100%;text-align:left;padding:5px 7px;cursor:pointer;
+    border:1.5px solid transparent;background:none;box-shadow:none;
+    font-family:var(--fsans);transition:background .12s,border-color .12s;user-select:none;border-radius:0}
+  .lpill:hover{background:var(--parchment-3)}
+  .lpill .sw{width:12px;height:12px;border:1.5px solid var(--espresso);flex:none;background:var(--pc,var(--ink-faint))}
   .lpill b{font-family:var(--fdisp);font-weight:600;font-size:14px;color:var(--espresso);letter-spacing:-.01em;
-    line-height:1;white-space:nowrap}
-  .lpill .ct{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--pc,var(--ink-dim));
-    background:var(--parchment-2);border:1.5px solid var(--rule);padding:1px 5px;line-height:1.3}
-  .lpill.on{background:var(--pc,var(--terracotta));border-color:var(--espresso);box-shadow:var(--shadow-sm);
-    transform:translate(-1px,-1px)}
-  .lpill.on b,.lpill.on .ct{color:var(--cream)}
-  .lpill.on .ct{background:rgba(0,0,0,.22);border-color:rgba(0,0,0,.25)}
-  .lpill.on .sw{border-color:var(--cream)}
-  .lpill.dimmed{opacity:.4}
+    line-height:1;white-space:nowrap;flex:1}
+  .lpill .ct{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ink-dim);line-height:1.3}
+  .lpill.on{background:var(--parchment-3);border-color:var(--espresso)}
+  .lpill.on .sw{box-shadow:0 0 0 2px var(--pc)}
+  .lpill.dimmed{opacity:.38}
   .legend .lclear{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;
-    color:var(--ink-faint);cursor:pointer;border:none;background:none;padding:4px 2px;display:none}
-  .legend.has-sel .lclear{display:inline}
+    color:var(--ink-faint);cursor:pointer;border:none;background:none;padding:6px 2px 1px;display:none}
+  .legend.has-sel .lclear{display:block}
   .legend .lclear:hover{color:var(--terracotta)}
 
   /* —— cluster popover (hover on a legend pill) —— */
@@ -680,6 +676,7 @@ function buildLegend(){
     const cls = `lpill ${selComm===id?'on':''} ${(selComm!=null&&selComm!==id)?'dimmed':''}`;
     pills += `<button class="${cls.trim()}" data-cid="${id}" style="--pc:${commColor(id)}">`+
              `<span class="sw"></span><b>Cluster ${id}</b><span class="ct">${cnt}</span></button>`;
+    // (count is rendered minimally; channels + insight live in the hover popover)
   }
   el.classList.toggle('has-sel', selComm!=null);
   el.innerHTML = `<span class="lh">Communities</span><div class="lpills">${pills}</div>`+
@@ -748,10 +745,11 @@ function showCpop(id, pill){
   cpop.classList.add('show');
   const r = pill.getBoundingClientRect();
   const pr = cpop.getBoundingClientRect();
-  let nx = r.left + r.width/2 - pr.width/2;
-  let ny = r.top - pr.height - 10;
-  nx = Math.max(8, Math.min(nx, innerWidth - pr.width - 8));
-  if(ny < 8) ny = r.bottom + 10;             // flip below if no room above
+  let nx = r.right + 12;                      // sit to the right of the row
+  if(nx + pr.width > innerWidth - 8) nx = r.left - pr.width - 12;  // flip left if no room
+  nx = Math.max(8, nx);
+  let ny = r.top + r.height/2 - pr.height/2;  // vertically centered on the row
+  ny = Math.max(8, Math.min(ny, innerHeight - pr.height - 8));
   cpop.style.left = nx+'px'; cpop.style.top = ny+'px';
 }
 function hideCpop(){ cpop.classList.remove('show'); }
@@ -1182,7 +1180,7 @@ function setView(v){
   ensureClusterPane();
   const showCanvas = (v!=='comm');
   cv.style.display = showCanvas?'block':'none';
-  document.getElementById('legend').style.display = (v==='force')?'flex':'none';
+  document.getElementById('legend').style.display = (v==='force')?'block':'none';
   document.getElementById('hint').style.display = showCanvas?'block':'none';
   if(v!=='force') hideCpop();
   if(clusterPane) clusterPane.style.display = (v==='comm')?'block':'none';
